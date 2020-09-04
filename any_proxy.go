@@ -198,8 +198,9 @@ func (c *clientPool) gc() {
 	d := len(c.pool) - (gMaxConn - 512)
 	log.Warningf("%d connections will be closed due to too many connections", d)
 	for i := 0; i < d; i++ {
-		if c.pool[ids[i]] != nil {
-			c.pool[ids[i]].Close()
+		conn := c.pool[ids[i]]
+		if conn != nil {
+			conn.Close()
 		}
 		delete(c.pool, ids[i])
 	}
