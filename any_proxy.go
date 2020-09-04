@@ -191,7 +191,9 @@ func (c *clientPool) gc(reserve int) {
 	log.Warningf("%d connections will be closed due to too many connections", len(ids)-reserve)
 
 	for i := 0; i < len(ids)-reserve; i++ {
-		c.pool[ids[i]].Close()
+		if c.pool[ids[i]] != nil {
+			c.pool[ids[i]].Close()
+		}
 		delete(c.pool, ids[i])
 	}
 }
