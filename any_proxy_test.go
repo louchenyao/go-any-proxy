@@ -16,7 +16,7 @@ func TestNilClientToGetOriginalDst(t *testing.T) {
 }
 
 func TestNilClientToHandleConnection(t *testing.T) {
-	handleConnection(nil)
+	handleConnection(nil, 0)
 }
 
 func TestNilClientToHandleDirectConnection(t *testing.T) {
@@ -28,13 +28,13 @@ func TestNilClientToHandleDirectConnection(t *testing.T) {
 	dirFuncs := buildDirectors(gDirects)
 	director = getDirector(dirFuncs)
 
-	handleDirectConnection(nil, ipv4, port)
+	handleDirectConnection(nil, ipv4, port, 0)
 }
 
 func TestNilClientToHandleProxyConnection(t *testing.T) {
 	var ipv4 string = "2.3.4.5"
 	var port uint16 = 8999
-	handleProxyConnection(nil, ipv4, port)
+	handleProxyConnection(nil, ipv4, port, 0)
 }
 
 // when a &net.TCPConn{} is created, the underlying fd is set to nil.
@@ -48,7 +48,7 @@ func TestEmptyFdToGetOriginalDst(t *testing.T) {
 func TestEmptyFdToHandleConnection(t *testing.T) {
 	var c1 *net.TCPConn
 	c1 = &net.TCPConn{}
-	handleConnection(c1)
+	handleConnection(c1, 0)
 }
 
 func TestEmptyFdToHandleDirectConnection(t *testing.T) {
@@ -62,7 +62,7 @@ func TestEmptyFdToHandleDirectConnection(t *testing.T) {
 
 	var c1 *net.TCPConn
 	c1 = &net.TCPConn{}
-	handleDirectConnection(c1, ipv4, port)
+	handleDirectConnection(c1, ipv4, port, 0)
 }
 
 func TestEmptyFdToHandleProxyConnection(t *testing.T) {
@@ -70,7 +70,7 @@ func TestEmptyFdToHandleProxyConnection(t *testing.T) {
 	var port uint16 = 8999
 	var c1 *net.TCPConn
 	c1 = &net.TCPConn{}
-	handleProxyConnection(c1, ipv4, port)
+	handleProxyConnection(c1, ipv4, port, 0)
 }
 
 // Test if direct connections are working
