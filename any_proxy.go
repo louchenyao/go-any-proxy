@@ -83,7 +83,7 @@ var (
 	gClientRedirects             int
 	gReverseLookups              int
 	gSNIParsing                  int
-	gMaxClients                  int
+	gMaxConn                     int
 )
 
 type cacheEntry struct {
@@ -188,6 +188,8 @@ func (c *clientPool) gc(reserve int) {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
+	log.Warningf("%d connections will be closed due to too many connections", len(ids)-reserve)
+
 	for i := 0; i < len(ids)-reserve; i++ {
 		c.pool[ids[i]].Close()
 		delete(c.pool, ids[i])
@@ -225,7 +227,7 @@ func init() {
 		fmt.Fprintf(os.Stdout, "                    then try port 3128 at 10.2.2.2)\n")
 		fmt.Fprintf(os.Stdout, "                   Note that requests are not load balanced. If a request fails to the\n")
 		fmt.Fprintf(os.Stdout, "                   first proxy, then the second is tried and so on.\n\n")
-		fmt.Fprintf(os.Stdout, "  -M=4096          Maximum number of allowed active clients. If there are too many new connections,\n")
+		fmt.Fprintf(os.Stdout, "  -M=4096          Maximum number of allowed active connections. If there are too many new connections,\n")
 		fmt.Fprintf(os.Stdout, "                   the oldest connections will be closed.\n\n")
 		fmt.Fprintf(os.Stdout, "  -r=1             Enable relaying of HTTP redirects from upstream to clients\n")
 		fmt.Fprintf(os.Stdout, "  -R=1             Enable reverse lookups of destination IP address and use hostname in CONNECT\n")
@@ -263,7 +265,7 @@ func init() {
 	flag.StringVar(&gLogfile, "f", gLogfile, "Log file")
 	flag.StringVar(&gListenAddrPort, "l", "", "Address and port to listen on")
 	flag.StringVar(&gMemProfile, "m", "", "Write mem profile to file")
-	flag.IntVar(&gMaxClients, "M", 4096, "Maximum number of clients.")
+	flag.IntVar(&gMaxConn, "M", 4096, "Maximum number of connections.")
 	flag.StringVar(&gProxyServerSpec, "p", "", "Proxy servers to use, separated by commas. E.g. -p proxy1.tld.com:80,proxy2.tld.com:8080,proxy3.tld.com:80")
 	flag.IntVar(&gClientRedirects, "r", 0, "Should we relay HTTP redirects from upstream proxies? -r=1 if we should.\n")
 	flag.IntVar(&gReverseLookups, "R", 0, "Should we perform reverse lookups of destination IPs and use hostnames? -h=1 if we should.\n")
@@ -430,15 +432,15 @@ func main() {
 	defer listener.Close()
 	log.Infof("Listening for connections on %v\n", listener.Addr())
 
-	if gMaxClients < 1024 {
+	if gMaxConn < 1024 {
 		log.Fatal("Number of allowed active clients shoule be at least 1024")
 	}
 	cp = newClientPool()
 
 	for {
 		// close connections if there are too much
-		if cp.size() >= gMaxClients {
-			cp.gc(gMaxClients - 512)
+		if cp.size() >= gMaxConn {
+			cp.gc(gMaxConn - 512)
 		}
 
 		conn, err := listener.AcceptTCP()
@@ -468,7 +470,7 @@ func checkProxies() {
 
 		log.Infof("Added proxy server %v\n", proxySpec)
 		if gSkipCheckUpstreamsReachable != 1 {
-			conn, err := dial(proxySpec)
+			conn, rid, err := dial(proxySpec)
 			if err != nil {
 				log.Infof("Test connection to %v: failed. Removing from proxy server list\n", proxySpec)
 				a := gProxyServers[:i]
@@ -476,6 +478,7 @@ func checkProxies() {
 				gProxyServers = append(a, b...)
 				continue
 			}
+			cp.del(rid)
 			conn.Close()
 		}
 	}
@@ -521,9 +524,7 @@ func copy(dst io.ReadWriteCloser, src io.ReadWriteCloser, dstname string, srcnam
 			}
 		}
 	}
-	if cid > 0 {
-		cp.del(cid)
-	}
+	cp.del(cid)
 	dst.Close()
 	src.Close()
 }
@@ -593,30 +594,37 @@ func getOriginalDst(clientConn *net.TCPConn) (ipv4 string, port uint16, newTCPCo
 	return
 }
 
-func dial(spec string) (*net.TCPConn, error) {
+func dial(spec string) (*net.TCPConn, uint64, error) {
 	host, port, err := net.SplitHostPort(spec)
 	if err != nil {
 		log.Infof("dial(): ERR: could not extract host and port from spec %v: %v", spec, err)
-		return nil, err
+		return nil, 0, err
 	}
 	remoteAddr, err := net.ResolveIPAddr("ip", host)
 	if err != nil {
 		log.Infof("dial(): ERR: could not resolve %v: %v", host, err)
-		return nil, err
+		return nil, 0, err
 	}
 	portInt, err := strconv.Atoi(port)
 	if err != nil {
 		log.Infof("dial(): ERR: could not convert network port from string \"%s\" to integer: %v", port, err)
-		return nil, err
+		return nil, 0, err
 	}
 	remoteAddrAndPort := &net.TCPAddr{IP: remoteAddr.IP, Port: portInt}
 	var localAddr *net.TCPAddr
 	localAddr = nil
+
+	if cp.size() > gMaxConn {
+		cp.gc(gMaxConn - 512)
+	}
+
 	conn, err := net.DialTCP("tcp", localAddr, remoteAddrAndPort)
 	if err != nil {
 		log.Infof("dial(): ERR: could not connect to %v:%v: %v", remoteAddrAndPort.IP, remoteAddrAndPort.Port, err)
 	}
-	return conn, err
+
+	rid := cp.add(conn)
+	return conn, rid, err
 }
 
 func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16, cid uint64) {
@@ -636,7 +644,7 @@ func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16, c
 	}
 
 	ipport := fmt.Sprintf("%s:%d", ipv4, port)
-	directConn, err := dial(ipport)
+	directConn, rid, err := dial(ipport)
 	if err != nil {
 		clientConnRemoteAddr := "?"
 		if clientConn != nil {
@@ -653,7 +661,7 @@ func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16, c
 	incrDirectConnections()
 
 	go copy(clientConn, directConn, "client", "directserver", cid)
-	go copy(directConn, clientConn, "directserver", "client", 0)
+	go copy(directConn, clientConn, "directserver", "client", rid)
 }
 
 func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16, cid uint64) {
@@ -664,6 +672,7 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16, ci
 	var connectHostname string
 	var headerXFF string = ""
 	var handshakeBuf bytes.Buffer
+	var rid uint64 = 0
 
 	// TODO: remove
 	log.Debugf("Enter handleProxyConnection: clientConn=%+v (%T)\n", clientConn, clientConn)
@@ -700,7 +709,7 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16, ci
 	}
 
 	for _, proxySpec := range gProxyServers {
-		proxyConn, err = dial(proxySpec)
+		proxyConn, rid, err = dial(proxySpec)
 		if err != nil {
 			log.Debugf("PROXY|%v->%v->%s:%d|Trying next proxy.", clientConn.RemoteAddr(), proxySpec, ipv4, port)
 			continue
@@ -769,7 +778,7 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16, ci
 	}
 	incrProxiedConnections()
 	go copy(clientConn, proxyConn, "client", "proxyserver", cid)
-	go copy(proxyConn, clientConn, "proxyserver", "client", 0)
+	go copy(proxyConn, clientConn, "proxyserver", "client", rid)
 }
 
 func handleConnection(clientConn *net.TCPConn, cid uint64) {
