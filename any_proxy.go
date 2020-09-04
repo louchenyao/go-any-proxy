@@ -52,9 +52,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -81,6 +83,7 @@ var (
 	gClientRedirects             int
 	gReverseLookups              int
 	gSNIParsing                  int
+	gMaxClients                  int
 )
 
 type cacheEntry struct {
@@ -132,6 +135,67 @@ type directorFunc func(*net.IP) bool
 
 var director func(*net.IP) (bool, int)
 
+type clientPool struct {
+	pool      map[uint64]net.Conn
+	idCounter uint64
+	mutex     sync.Mutex
+}
+
+func newClientPool() *clientPool {
+	return &clientPool{
+		pool:      make(map[uint64]net.Conn),
+		idCounter: 0,
+	}
+}
+
+// add a new connection to the pool and return the traking id
+func (c *clientPool) add(conn net.Conn) uint64 {
+	c.mutex.Lock() // lock for map, not for the counter
+	defer c.mutex.Unlock()
+
+	id := atomic.AddUint64(&c.idCounter, 1)
+	c.pool[id] = conn
+
+	return id
+}
+
+// delete the connection from the pool
+func (c *clientPool) del(id uint64) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	_, ok := c.pool[id]
+	if ok {
+		delete(c.pool, id)
+	}
+}
+
+func (c *clientPool) size() int {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	return len(c.pool)
+}
+
+// release connections until the number of connections is smaller than `reserve`
+func (c *clientPool) gc(reserve int) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	ids := make([]uint64, len(c.pool))
+	for k := range c.pool {
+		ids = append(ids, k)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	for i := 0; i < len(ids)-reserve; i++ {
+		c.pool[ids[i]].Close()
+		delete(c.pool, ids[i])
+	}
+}
+
+var cp *clientPool
+
 func init() {
 	dir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
 	gConfFile = dir + "/any_proxy.conf"
@@ -161,6 +225,8 @@ func init() {
 		fmt.Fprintf(os.Stdout, "                    then try port 3128 at 10.2.2.2)\n")
 		fmt.Fprintf(os.Stdout, "                   Note that requests are not load balanced. If a request fails to the\n")
 		fmt.Fprintf(os.Stdout, "                   first proxy, then the second is tried and so on.\n\n")
+		fmt.Fprintf(os.Stdout, "  -M=4096          Maximum number of allowed active clients. If there are too many new connections,\n")
+		fmt.Fprintf(os.Stdout, "                   the oldest connections will be closed.\n\n")
 		fmt.Fprintf(os.Stdout, "  -r=1             Enable relaying of HTTP redirects from upstream to clients\n")
 		fmt.Fprintf(os.Stdout, "  -R=1             Enable reverse lookups of destination IP address and use hostname in CONNECT\n")
 		fmt.Fprintf(os.Stdout, "                   request instead of the numeric IP if available. A local DNS server could be\n")
@@ -197,6 +263,7 @@ func init() {
 	flag.StringVar(&gLogfile, "f", gLogfile, "Log file")
 	flag.StringVar(&gListenAddrPort, "l", "", "Address and port to listen on")
 	flag.StringVar(&gMemProfile, "m", "", "Write mem profile to file")
+	flag.IntVar(&gMaxClients, "M", 4096, "Maximum number of clients.")
 	flag.StringVar(&gProxyServerSpec, "p", "", "Proxy servers to use, separated by commas. E.g. -p proxy1.tld.com:80,proxy2.tld.com:8080,proxy3.tld.com:80")
 	flag.IntVar(&gClientRedirects, "r", 0, "Should we relay HTTP redirects from upstream proxies? -r=1 if we should.\n")
 	flag.IntVar(&gReverseLookups, "R", 0, "Should we perform reverse lookups of destination IPs and use hostnames? -h=1 if we should.\n")
@@ -318,7 +385,7 @@ func setupLogging() {
 		log.SetLevel(log.DEBUG)
 	}
 
-	fmt.Printf("gLogfile = %s", gLogfile)
+	fmt.Printf("gLogfile = %s\n", gLogfile)
 
 	if err := log.OpenFile(gLogfile, log.FLOG_APPEND, 0644); err != nil {
 		log.Fatalf("Unable to open log file : %s", err)
@@ -363,17 +430,26 @@ func main() {
 	defer listener.Close()
 	log.Infof("Listening for connections on %v\n", listener.Addr())
 
-	// set up quue
+	if gMaxClients < 1024 {
+		log.Fatal("Number of allowed active clients shoule be at least 1024")
+	}
+	cp = newClientPool()
 
 	for {
+		// close connections if there are too much
+		if cp.size() >= gMaxClients {
+			cp.gc(gMaxClients - 512)
+		}
+
 		conn, err := listener.AcceptTCP()
 		if err != nil {
 			log.Infof("Error accepting connection: %v\n", err)
 			incrAcceptErrors()
 			continue
 		}
+		cid := cp.add(conn)
 		incrAcceptSuccesses()
-		go handleConnection(conn)
+		go handleConnection(conn, cid)
 	}
 }
 
@@ -412,7 +488,7 @@ func checkProxies() {
 	}
 }
 
-func copy(dst io.ReadWriteCloser, src io.ReadWriteCloser, dstname string, srcname string) {
+func copy(dst io.ReadWriteCloser, src io.ReadWriteCloser, dstname string, srcname string, cid uint64) {
 	if dst == nil {
 		log.Debugf("copy(): oops, dst is nil!")
 		return
@@ -444,6 +520,9 @@ func copy(dst io.ReadWriteCloser, src io.ReadWriteCloser, dstname string, srcnam
 				}
 			}
 		}
+	}
+	if cid > 0 {
+		cp.del(cid)
 	}
 	dst.Close()
 	src.Close()
@@ -540,7 +619,7 @@ func dial(spec string) (*net.TCPConn, error) {
 	return conn, err
 }
 
-func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
+func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16, cid uint64) {
 	// TODO: remove
 	log.Debugf("Enter handleDirectConnection: clientConn=%+v (%T)\n", clientConn, clientConn)
 
@@ -573,11 +652,11 @@ func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
 	log.Debugf("DIRECT|%v->%v|Connected to remote end", clientConn.RemoteAddr(), directConn.RemoteAddr())
 	incrDirectConnections()
 
-	go copy(clientConn, directConn, "client", "directserver")
-	go copy(directConn, clientConn, "directserver", "client")
+	go copy(clientConn, directConn, "client", "directserver", cid)
+	go copy(directConn, clientConn, "directserver", "client", 0)
 }
 
-func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
+func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16, cid uint64) {
 	var proxyConn net.Conn
 	var err error
 	var success bool = false
@@ -657,14 +736,14 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
 			log.Debugf("PROXY|%v->%v->%s:%d|Status from proxy=400 (Bad Request)", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port)
 			log.Debugf("%v: Response from proxy=400", proxySpec)
 			incrProxy400Responses()
-			copy(clientConn, proxyConn, "client", "proxyserver")
+			copy(clientConn, proxyConn, "client", "proxyserver", cid)
 			return
 		}
 		if strings.Contains(status, "301") || strings.Contains(status, "302") && gClientRedirects == 1 {
 			log.Debugf("PROXY|%v->%v->%s:%d|Status from proxy=%s (Redirect), relaying response to client", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port, strconv.Quote(status))
 			incrProxy300Responses()
 			fmt.Fprintf(clientConn, status)
-			copy(clientConn, proxyConn, "client", "proxyserver")
+			copy(clientConn, proxyConn, "client", "proxyserver", cid)
 			return
 		}
 		if strings.Contains(status, "200") == false {
@@ -689,11 +768,11 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
 		return
 	}
 	incrProxiedConnections()
-	go copy(clientConn, proxyConn, "client", "proxyserver")
-	go copy(proxyConn, clientConn, "proxyserver", "client")
+	go copy(clientConn, proxyConn, "client", "proxyserver", cid)
+	go copy(proxyConn, clientConn, "proxyserver", "client", 0)
 }
 
-func handleConnection(clientConn *net.TCPConn) {
+func handleConnection(clientConn *net.TCPConn, cid uint64) {
 	if clientConn == nil {
 		log.Debugf("handleConnection(): oops, clientConn is nil")
 		return
@@ -713,16 +792,16 @@ func handleConnection(clientConn *net.TCPConn) {
 	}
 	// If no upstream proxies were provided on the command line, assume all traffic should be sent directly
 	if gProxyServerSpec == "" {
-		handleDirectConnection(clientConn, ipv4, port)
+		handleDirectConnection(clientConn, ipv4, port, cid)
 		return
 	}
 	// Evaluate for direct connection
 	ip := net.ParseIP(ipv4)
 	if ok, _ := director(&ip); ok {
-		handleDirectConnection(clientConn, ipv4, port)
+		handleDirectConnection(clientConn, ipv4, port, cid)
 		return
 	}
-	handleProxyConnection(clientConn, ipv4, port)
+	handleProxyConnection(clientConn, ipv4, port, cid)
 }
 
 // from pkg/net/parse.go
