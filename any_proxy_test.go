@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"testing"
+	"time"
 )
 
 //func TestNilCopy(t *testing.T) {
@@ -17,6 +19,30 @@ func TestNilClientToGetOriginalDst(t *testing.T) {
 
 func TestNilClientToHandleConnection(t *testing.T) {
 	handleConnection(nil, 0)
+}
+
+func TestFloodTCPConnection(t *testing.T) {
+	ipv4 := "93.184.216.34"
+	port := uint16(80)
+	gMaxConn = 1024
+
+	cp = newClientPool()
+
+	new := func() {
+		ipport := fmt.Sprintf("%s:%d", ipv4, port)
+		con1, cid, _ := dial(ipport)
+		handleDirectConnection(con1, ipv4, port, cid)
+	}
+
+	for i := 0; i < 2000; i++ {
+		go new()
+	}
+
+	time.Sleep(2000 * time.Millisecond)
+	cp.gc()
+	if cp.size() >= 1024 {
+		t.Error("The size of client pool exceeds 1024")
+	}
 }
 
 func TestNilClientToHandleDirectConnection(t *testing.T) {

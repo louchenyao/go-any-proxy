@@ -46,13 +46,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,24 +178,32 @@ func (c *clientPool) size() int {
 }
 
 // release connections until the number of connections is smaller than `reserve`
-func (c *clientPool) gc(reserve int) {
+func (c *clientPool) gc() {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	ids := make([]uint64, len(c.pool))
+	if len(c.pool) < gMaxConn {
+		return
+	}
+
+	// shuffle the ids
+	ids := make([]uint64, 0)
 	for k := range c.pool {
 		ids = append(ids, k)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	rand.Shuffle(len(ids), func(i, j int) {
+		ids[i], ids[j] = ids[j], ids[i]
+	})
 
-	log.Warningf("%d connections will be closed due to too many connections", len(ids)-reserve)
-
-	for i := 0; i < len(ids)-reserve; i++ {
+	d := len(c.pool) - (gMaxConn - 512)
+	log.Warningf("%d connections will be closed due to too many connections", d)
+	for i := 0; i < d; i++ {
 		if c.pool[ids[i]] != nil {
 			c.pool[ids[i]].Close()
 		}
 		delete(c.pool, ids[i])
 	}
+	log.Warningf("%d connections remain in the pool", len(c.pool))
 }
 
 var cp *clientPool
@@ -230,7 +238,7 @@ func init() {
 		fmt.Fprintf(os.Stdout, "                   Note that requests are not load balanced. If a request fails to the\n")
 		fmt.Fprintf(os.Stdout, "                   first proxy, then the second is tried and so on.\n\n")
 		fmt.Fprintf(os.Stdout, "  -M=4096          Maximum number of allowed active connections. If there are too many new connections,\n")
-		fmt.Fprintf(os.Stdout, "                   the oldest connections will be closed.\n\n")
+		fmt.Fprintf(os.Stdout, "                   old connections will be closed.\n\n")
 		fmt.Fprintf(os.Stdout, "  -r=1             Enable relaying of HTTP redirects from upstream to clients\n")
 		fmt.Fprintf(os.Stdout, "  -R=1             Enable reverse lookups of destination IP address and use hostname in CONNECT\n")
 		fmt.Fprintf(os.Stdout, "                   request instead of the numeric IP if available. A local DNS server could be\n")
@@ -441,9 +449,7 @@ func main() {
 
 	for {
 		// close connections if there are too much
-		if cp.size() >= gMaxConn {
-			cp.gc(gMaxConn - 512)
-		}
+		cp.gc()
 
 		conn, err := listener.AcceptTCP()
 		if err != nil {
@@ -616,9 +622,7 @@ func dial(spec string) (*net.TCPConn, uint64, error) {
 	var localAddr *net.TCPAddr
 	localAddr = nil
 
-	if cp.size() > gMaxConn {
-		cp.gc(gMaxConn - 512)
-	}
+	cp.gc()
 
 	conn, err := net.DialTCP("tcp", localAddr, remoteAddrAndPort)
 	if err != nil {
