@@ -18,7 +18,7 @@ func TestNilClientToGetOriginalDst(t *testing.T) {
 }
 
 func TestNilClientToHandleConnection(t *testing.T) {
-	handleConnection(nil, 0)
+	handleConnection(nil)
 }
 
 func TestFloodTCPConnection(t *testing.T) {
@@ -74,7 +74,7 @@ func TestEmptyFdToGetOriginalDst(t *testing.T) {
 func TestEmptyFdToHandleConnection(t *testing.T) {
 	var c1 *net.TCPConn
 	c1 = &net.TCPConn{}
-	handleConnection(c1, 0)
+	handleConnection(c1)
 }
 
 func TestEmptyFdToHandleDirectConnection(t *testing.T) {

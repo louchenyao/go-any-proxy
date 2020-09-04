@@ -187,7 +187,7 @@ func (c *clientPool) gc() {
 	}
 
 	// shuffle the ids
-	ids := make([]uint64, 0)
+	var ids []uint64
 	for k := range c.pool {
 		ids = append(ids, k)
 	}
@@ -458,9 +458,8 @@ func main() {
 			incrAcceptErrors()
 			continue
 		}
-		cid := cp.add(conn)
 		incrAcceptSuccesses()
-		go handleConnection(conn, cid)
+		go handleConnection(conn)
 	}
 }
 
@@ -544,6 +543,7 @@ func getOriginalDst(clientConn *net.TCPConn) (ipv4 string, port uint16, newTCPCo
 		err = errors.New("ERR: clientConn is nil")
 		return
 	}
+	defer clientConn.Close() // close the old one
 
 	// test if the underlying fd is nil
 	remoteAddr := clientConn.RemoteAddr()
@@ -564,8 +564,6 @@ func getOriginalDst(clientConn *net.TCPConn) (ipv4 string, port uint16, newTCPCo
 	if err != nil {
 		log.Infof("GETORIGINALDST|%v->?->FAILEDTOBEDETERMINED|ERR: could not get a copy of the client connection's file object", srcipport)
 		return
-	} else {
-		clientConn.Close()
 	}
 
 	// Get original destination
@@ -788,7 +786,7 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16, ci
 	go copy(proxyConn, clientConn, "proxyserver", "client", rid)
 }
 
-func handleConnection(clientConn *net.TCPConn, cid uint64) {
+func handleConnection(clientConn *net.TCPConn) {
 	if clientConn == nil {
 		log.Debugf("handleConnection(): oops, clientConn is nil")
 		return
@@ -806,6 +804,8 @@ func handleConnection(clientConn *net.TCPConn, cid uint64) {
 		log.Infof("handleConnection(): can not handle this connection, error occurred in getting original destination ip address/port: %+v\n", err)
 		return
 	}
+	cid := cp.add(clientConn)
+
 	// If no upstream proxies were provided on the command line, assume all traffic should be sent directly
 	if gProxyServerSpec == "" {
 		handleDirectConnection(clientConn, ipv4, port, cid)
