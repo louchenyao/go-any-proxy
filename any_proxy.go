@@ -363,12 +363,11 @@ func main() {
 	defer listener.Close()
 	log.Infof("Listening for connections on %v\n", listener.Addr())
 
-	// set up quue
-
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
-			log.Infof("Error accepting connection: %v\n", err)
+			// use fatal to kill itsel
+			log.Fatalf("Error accepting connection: %v\n", err)
 			incrAcceptErrors()
 			continue
 		}
